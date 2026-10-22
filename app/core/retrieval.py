@@ -49,6 +49,10 @@ RERANK_URL = CHAT_BASE_URL.rstrip("/") + "/rerank"
 DEFAULT_IMAGE_QUOTA = 2
 DEFAULT_VIDEO_QUOTA = 1
 
+# P2-1 媒体定向检索通道：存在模态配额时，每个目标模态从全库向量结果中
+# 至少取 top-N 附加到融合候选池，保证配额补入有候选可用
+DIRECT_RECALL_TOP = 3
+
 
 # ========== 查询改写 ==========
 
@@ -450,19 +454,25 @@ def hybrid_retrieve(
 
     # 2. 向量检索（复用 query.search_vectors，返回 (distance, business_id, metadata)）
     query_vec = query.get_text_embedding(search_query)
-    vector_results = query.search_vectors(query_vec, qdrant_client, top_k=HYBRID_RECALL_TOP * 2)
+    # P2-1：存在模态配额时向量召回深度扩至全库，保证语义距离较远的目标模态条目
+    # （如文本意图查询下的视频）也能进入候选池；无配额时维持 top-40 深度不变
+    vector_top_k = None if modality_quota else HYBRID_RECALL_TOP * 2
+    vector_results_all = query.search_vectors(query_vec, qdrant_client, top_k=vector_top_k)
 
     # 类型过滤：仅保留 allowed_types 内的条目
     if allowed_types is not None:
-        vector_results = [
-            (dist, bid, m) for dist, bid, m in vector_results
+        vector_results_all = [
+            (dist, bid, m) for dist, bid, m in vector_results_all
             if m.get("type") in allowed_types and not m.get("deleted", False)
         ]
     else:
-        vector_results = [
-            (dist, bid, m) for dist, bid, m in vector_results
+        vector_results_all = [
+            (dist, bid, m) for dist, bid, m in vector_results_all
             if not m.get("deleted", False)
         ]
+
+    # 主通道保持 top-40 深度参与 RRF 融合，避免全库低分条目稀释融合排序
+    vector_results = vector_results_all[:HYBRID_RECALL_TOP * 2]
 
     # 3. BM25 检索
     bm25_results: List[Tuple[float, Dict]] = []
@@ -484,6 +494,32 @@ def hybrid_retrieve(
     # 4. RRF 融合
     fused = rrf_fusion(vector_results, bm25_results, k=RRF_K)
 
+    # P2-1 媒体定向检索通道：对配额模态从全量向量结果中取 top-N 附加到融合列表尾部，
+    # 保证 _apply_modality_quota 有候选可补。定向条目 rrf_score=0 排在自然召回条目之后，
+    # 仅在自然召回中该模态条目不足时才会被配额补入；vector_distance 保留真实检索距离，
+    # 下游距离阈值过滤（如 video_search 的 MEDIA_DISTANCE_THRESHOLD）行为不受影响
+    if modality_quota:
+        fused_ids = {m.get("id") for _, m in fused}
+        for modality, min_n in modality_quota.items():
+            direct_limit = max(min_n, DIRECT_RECALL_TOP)
+            direct_added = 0
+            for dist, _, m in vector_results_all:
+                if m.get("type") != modality:
+                    continue
+                pid = m.get("id")
+                if pid is None or pid in fused_ids:
+                    continue
+                mc = m.copy()
+                mc["rrf_score"] = 0.0
+                mc["vector_distance"] = float(dist)
+                fused.append((0.0, mc))
+                fused_ids.add(pid)
+                direct_added += 1
+                if direct_added >= direct_limit:
+                    break
+            if direct_added:
+                logger.info("定向通道补入 %s 模态 %s 条", modality, direct_added)
+
     # 融合后取 top-20 送入 rerank
     candidates = [m for _, m in fused[:HYBRID_RECALL_TOP]]
 
@@ -495,8 +531,10 @@ def hybrid_retrieve(
         reranked = candidates[:k]
 
     # 6. 模态配额：保证 top-k 中目标模态至少占 N 条，防止图片/视频被多数文本条目挤出
+    # 候选池扩展为全量融合列表，确保低排名的视频/图片向量也能进入配额补入流程
     if modality_quota:
-        reranked = _apply_modality_quota(reranked, candidates, modality_quota, k)
+        all_fused = [m for _, m in fused]
+        reranked = _apply_modality_quota(reranked, all_fused, modality_quota, k)
 
     logger.info(
         "混合检索完成: query='%s' (改写='%s') -> 向量 %s 条 + BM25 %s 条 -> 融合 %s 条 -> %s 条结果 (配额=%s)",

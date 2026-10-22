@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 
 from app.config import MEDIA_DISTANCE_THRESHOLD
 from app.core import query
+from app.core.cost_tracker import tracked_chat_completion
 
 
 # 类型别名：Qdrant 客户端 + 元数据列表，作为 RAG 检索的输入
@@ -94,13 +95,16 @@ def rag_ask_api(
 [用户问题]
 {query_str}
 """
-    completion = query.client.chat.completions.create(
+    # 走 tracked_chat_completion：自带空响应防护 + 指数退避重试，避免网关瞬时故障导致服务崩溃
+    completion = tracked_chat_completion(
+        client=query.client,
         model=query.CHAT_MODEL,
         messages=[
             {"role": "system", "content": "你是一个迪士尼客服助手。"},
             {"role": "user", "content": prompt}
         ],
         temperature=0.3,
+        source="rag_ask_api",
     )
     answer = completion.choices[0].message.content
 

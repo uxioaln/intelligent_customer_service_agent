@@ -52,6 +52,33 @@ PROGRESS_LOG_EVERY = 5         # 每 N 条打印一次进度
 # ========== 输入/输出文件 ==========
 EVAL_DATASET_FILE = os.path.join(STATS_DIR, "eval_dataset.json")
 REPORT_FILE = os.path.join(STATS_DIR, "accuracy_eval_report.json")
+# 断点续跑中间结果文件：每完成一条查询立即持久化，崩溃后重启可跳过已完成项
+PARTIAL_FILE = os.path.join(STATS_DIR, "accuracy_eval_report.partial.json")
+
+
+def _load_partial() -> Dict[str, Any]:
+    """加载断点续跑中间结果，不存在或损坏时返回空结构"""
+    if not os.path.exists(PARTIAL_FILE):
+        return {"baseline_results": [], "agent_results": [], "completed_ids": []}
+    try:
+        with open(PARTIAL_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("baseline_results", [])
+        data.setdefault("agent_results", [])
+        data.setdefault("completed_ids", [])
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("partial 文件损坏，从头开始: %s", e)
+        return {"baseline_results": [], "agent_results": [], "completed_ids": []}
+
+
+def _save_partial(partial: Dict[str, Any]) -> None:
+    """原子写中间结果（先写临时文件再 rename，避免崩溃时截断 JSON）"""
+    os.makedirs(STATS_DIR, exist_ok=True)
+    tmp_file = PARTIAL_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(partial, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_file, PARTIAL_FILE)
 
 
 # ========== LLM-as-judge ==========
@@ -267,6 +294,38 @@ def load_complex_queries() -> List[Dict[str, Any]]:
     return data.get("complex_queries", [])
 
 
+def _recount_from_results(baseline_judge_results: List[Dict[str, Any]],
+                          agent_judge_results: List[Dict[str, Any]]) -> Dict[str, int]:
+    """从已累加的结果列表中重算所有计数器（断点恢复时用于初始化）"""
+    counts = {
+        "baseline_correct_count": 0,
+        "baseline_hallucination_count": 0,
+        "agent_correct_count": 0,
+        "agent_hallucination_count": 0,
+        "agent_skip_count": 0,
+        "agent_abstain_count": 0,
+        "agent_retry_count": 0,
+    }
+    for r in baseline_judge_results:
+        if r.get("judge_correct"):
+            counts["baseline_correct_count"] += 1
+        if r.get("is_hallucination") is True:
+            counts["baseline_hallucination_count"] += 1
+    for r in agent_judge_results:
+        if r.get("judge_correct"):
+            counts["agent_correct_count"] += 1
+        hallu = r.get("is_hallucination")
+        if hallu == "skipped" or hallu is None:
+            counts["agent_skip_count"] += 1
+        elif hallu is True:
+            counts["agent_hallucination_count"] += 1
+        if r.get("retried"):
+            counts["agent_retry_count"] += 1
+        if r.get("abstained"):
+            counts["agent_abstain_count"] += 1
+    return counts
+
+
 def main():
     print("=" * 60)
     print("  首答准确率 + 幻觉率评测")
@@ -282,49 +341,46 @@ def main():
         print("  评测集为空，退出")
         return
 
+    # ===== 断点续跑：加载已完成的中间结果 =====
+    partial = _load_partial()
+    completed_ids = set(partial.get("completed_ids", []))
+    baseline_judge_results: List[Dict[str, Any]] = partial.get("baseline_results", [])
+    agent_judge_results: List[Dict[str, Any]] = partial.get("agent_results", [])
+    if completed_ids:
+        logger.info("检测到断点续跑文件，已完成 %s 条，将跳过", len(completed_ids))
+
+    # 从 partial 结果中恢复计数器
+    counts = _recount_from_results(baseline_judge_results, agent_judge_results)
+    baseline_correct_count = counts["baseline_correct_count"]
+    baseline_hallucination_count = counts["baseline_hallucination_count"]
+    agent_correct_count = counts["agent_correct_count"]
+    agent_hallucination_count = counts["agent_hallucination_count"]
+    agent_skip_count = counts["agent_skip_count"]
+    agent_abstain_count = counts["agent_abstain_count"]
+    agent_retry_count = counts["agent_retry_count"]
+
     # judge 调用走独立 tracker（基线/Agent 各自内部也有成本统计）
     judge_tracker = CostTracker()
     judge_tracker.begin()
     baseline_validation_tracker = CostTracker()
     baseline_validation_tracker.begin()
 
-    baseline_judge_results = []
-    agent_judge_results = []
-    baseline_hallucination_count = 0
-    agent_hallucination_count = 0
-    agent_retry_count = 0
-    agent_skip_count = 0  # 跳过验证的样本数（references 为空，无法判定幻觉）
-    agent_abstain_count = 0  # Agent 拒答回复数（验证失败后拒答）
-    baseline_correct_count = 0
-    agent_correct_count = 0
-
     for i, q_item in enumerate(queries, 1):
+        q_id = q_item.get("id", "")
         q_text = q_item["query"]
         expected = q_item.get("expected_answer", "")
+
+        # 断点续跑：已完成的 query 直接跳过
+        if q_id in completed_ids:
+            logger.info("[%s/%s] 跳过已完成 id=%s", i, len(queries), q_id)
+            continue
+
         logger.info("[%s/%s] query=%s", i, len(queries), q_text[:50])
 
-        # ----- 基线 RAG（带重试，处理 API 限流返回空 choices 的瞬时故障）-----
-        baseline_result = None
-        for attempt in range(3):
-            try:
-                baseline_result = run_baseline(q_text)
-                break
-            except TypeError as e:
-                if "'NoneType'" in str(e) and attempt < 2:
-                    logger.warning("基线评测第 %s 次重试（API 返回空响应）: %s", attempt + 1, q_text[:50])
-                    time.sleep(10)
-                else:
-                    raise
-            except Exception as e:
-                if attempt < 2:
-                    logger.warning("基线评测第 %s 次重试: %s", attempt + 1, q_text[:50])
-                    time.sleep(10)
-                else:
-                    raise
-        if baseline_result is None:
-            baseline_judge_results.append({"id": q_item.get("id", ""), "query": q_text, "error": "重试3次仍失败", "judge_correct": False, "is_hallucination": True})
-            continue
+        # ----- 基线 RAG -----
+        # LLM 调用已在 tracked_chat_completion 内建重试，此处仅捕获最终失败兜底
         try:
+            baseline_result = run_baseline(q_text)
             baseline_judge = judge_answer(q_text, expected, baseline_result["answer"], judge_tracker,
                                           references=baseline_result.get("references", []))
             baseline_hallu = is_hallucination_for_baseline(baseline_result, baseline_validation_tracker)
@@ -333,7 +389,7 @@ def main():
             if baseline_judge["correct"]:
                 baseline_correct_count += 1
             baseline_judge_results.append({
-                "id": q_item.get("id", ""),
+                "id": q_id,
                 "query": q_text,
                 "expected_answer": expected,
                 "actual_answer": baseline_result["answer"][:300],
@@ -348,7 +404,7 @@ def main():
         except Exception as e:
             logger.exception("基线评测失败: %s", q_text)
             baseline_judge_results.append({
-                "id": q_item.get("id", ""),
+                "id": q_id,
                 "query": q_text,
                 "error": str(e),
                 "judge_correct": False,
@@ -356,28 +412,9 @@ def main():
             })
         time.sleep(LLM_CALL_INTERVAL)
 
-        # ----- Agent（带重试）-----
-        agent_result = None
-        for attempt in range(3):
-            try:
-                agent_result = run_agent(q_text)
-                break
-            except TypeError as e:
-                if "'NoneType'" in str(e) and attempt < 2:
-                    logger.warning("Agent 评测第 %s 次重试（API 返回空响应）: %s", attempt + 1, q_text[:50])
-                    time.sleep(10)
-                else:
-                    raise
-            except Exception as e:
-                if attempt < 2:
-                    logger.warning("Agent 评测第 %s 次重试: %s", attempt + 1, q_text[:50])
-                    time.sleep(10)
-                else:
-                    raise
-        if agent_result is None:
-            agent_judge_results.append({"id": q_item.get("id", ""), "query": q_text, "error": "重试3次仍失败", "judge_correct": False})
-            continue
+        # ----- Agent -----
         try:
+            agent_result = run_agent(q_text)
             agent_judge = judge_answer(q_text, expected, agent_result["answer"], judge_tracker,
                                        references=agent_result.get("references", []))
             agent_hallu = is_hallucination_for_agent(agent_result)
@@ -394,7 +431,7 @@ def main():
             # 提取 claim 级指标
             val = agent_result.get("validation") or {}
             agent_judge_results.append({
-                "id": q_item.get("id", ""),
+                "id": q_id,
                 "query": q_text,
                 "expected_answer": expected,
                 "actual_answer": agent_result["answer"][:300],
@@ -415,13 +452,21 @@ def main():
         except Exception as e:
             logger.exception("Agent 评测失败: %s", q_text)
             agent_judge_results.append({
-                "id": q_item.get("id", ""),
+                "id": q_id,
                 "query": q_text,
                 "error": str(e),
                 "judge_correct": False,
                 "is_hallucination": True,
             })
         time.sleep(LLM_CALL_INTERVAL)
+
+        # ===== 断点续跑：每条完成后立即持久化 =====
+        completed_ids.add(q_id)
+        _save_partial({
+            "baseline_results": baseline_judge_results,
+            "agent_results": agent_judge_results,
+            "completed_ids": sorted(completed_ids),
+        })
 
         if i % PROGRESS_LOG_EVERY == 0 or i == len(queries):
             logger.info("  进度 %s/%s | 基线准确 %s/幻觉 %s | Agent 准确 %s/幻觉 %s/跳过 %s/拒答 %s/重试 %s",
@@ -488,6 +533,14 @@ def main():
     with open(REPORT_FILE, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     logger.info("已保存准确率评测报告 -> %s", REPORT_FILE)
+
+    # 评测完整跑通后删除断点续跑 partial 文件，避免下次启动误恢复旧进度
+    if os.path.exists(PARTIAL_FILE):
+        try:
+            os.remove(PARTIAL_FILE)
+            logger.info("已清理断点续跑 partial 文件: %s", PARTIAL_FILE)
+        except OSError as e:
+            logger.warning("清理 partial 文件失败: %s", e)
 
     print("\n" + "=" * 60)
     print("  首答准确率 + 幻觉率评测完成")

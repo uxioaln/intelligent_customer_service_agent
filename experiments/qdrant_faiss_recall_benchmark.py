@@ -15,12 +15,15 @@ experiments.5-qdrant_faiss_recall_benchmark - Qdrant vs FAISS 召回质量离线
 使用方法：
     export DASHSCOPE_API_KEY=xxx
     export AGICTO_API_KEY=xxx
-    python experiments/5-qdrant_faiss_recall_benchmark.py
+    # HNSW/ef 生效前提：服务端模式（本地持久化模式退化为精确搜索，ef 不生效）
+    export QDRANT_URL=http://localhost:6333
+    python experiments/qdrant_faiss_recall_benchmark.py
 
 依赖（FAISS 仅实验脚本临时使用）：
     pip install faiss-cpu==1.7.4 -i https://pypi.tuna.tsinghua.edu.cn/simple
 """
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -42,12 +45,13 @@ from app.config import (
     DB_FILE,
     DOCS_DIR,
     INDEX_DIR,
-    QDRANT_COLLECTION_NAME,
+    MULTIMODAL_EMBEDDING_MODEL,
     QDRANT_SEARCH_EF,
     QDRANT_VECTOR_SIZE,
     STATS_DIR,
 )
 from app.core.query import client as agicto_client, get_text_embedding
+from app.core.cost_tracker import tracked_chat_completion
 from app.index.builder import (
     get_qdrant_client,
     parse_docx,
@@ -67,7 +71,7 @@ QUESTIONS_PER_CHUNK = 3      # 每个 chunk 生成的问题数
 TARGET_HISTORY_QUERY_COUNT = 20  # 从历史对话抽取的 query 数量上限
 GT_TOP_K = 20                # Ground Truth Top-K（暴力搜索精确 Top-20）
 SEARCH_TOP_K = 10            # 检索 Top-K
-HNSW_EF_LIST = [128, 256, 512]  # 待测试的 hnsw_ef 档位（精简为 3 档）
+HNSW_EF_LIST = [8, 16, 32, 64, 96, 128, 192, 256, 384, 512]  # 10 档覆盖从低召回到满召回的完整权衡区间
 FAISS_NPROBE = 1             # FAISS IVF nprobe（与旧生产配置一致）
 EMBEDDING_CALL_INTERVAL = 0.1  # embedding 调用间隔（秒），避免触发限流
 LLM_CALL_INTERVAL = 0.2        # LLM 调用间隔（秒）
@@ -79,11 +83,36 @@ GT_FILE = os.path.join(STATS_DIR, "benchmark_ground_truth.json")
 EMBEDDINGS_FILE = os.path.join(STATS_DIR, "benchmark_query_embeddings.npy")
 REPORT_FILE = os.path.join(STATS_DIR, "recall_benchmark_report.json")
 
+# 基准专用 collection（独立于生产 disney_knowledge，可用环境变量 BENCH_COLLECTION 覆盖）
+BENCH_COLLECTION_NAME = os.getenv("BENCH_COLLECTION", "disney_knowledge_bench")
+# embedding 缓存指纹 sidecar：模型或查询变更后禁止复用旧缓存（防止跨模型世代向量混算）
+EMBEDDINGS_META_FILE = os.path.join(STATS_DIR, "benchmark_query_embeddings.meta.json")
+# 沉淀知识文件（LLM 从历史对话提炼的结构化知识，作为 query 种子源补充）
+DISNEY_DISTILLED_FILE = os.path.join(STATS_DIR, "disney_distilled.json")
+
 # FAISS backup 目录
 FAISS_BACKUP_DIR = os.path.join(INDEX_DIR, "backup")
 
 
 # ========== 工具函数 ==========
+
+def _docs_signature() -> str:
+    """DOCS_DIR 下 docx 文件签名（文件名+大小+mtime），用于查询缓存指纹溯源"""
+    parts = []
+    for filename in sorted(os.listdir(DOCS_DIR)):
+        if not filename.endswith(".docx"):
+            continue
+        file_path = os.path.join(DOCS_DIR, filename)
+        if os.path.isfile(file_path):
+            st = os.stat(file_path)
+            parts.append("%s:%s:%s" % (filename, st.st_size, int(st.st_mtime)))
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _queries_hash(queries: List[str]) -> str:
+    """查询列表内容 hash，embedding 缓存指纹的核心字段"""
+    return hashlib.sha256("\n".join(queries).encode("utf-8")).hexdigest()[:16]
+
 
 def _import_faiss():
     """延迟导入 faiss，提供安装提示"""
@@ -100,12 +129,14 @@ def chat_completion(prompt: str, model: str = CHAT_MODEL) -> str:
     """调用 AGICTO chat LLM 生成文本（复用 app.core.query 的 client）
 
     项目约定：所有 chat LLM 调用使用 AGICTO 平台。
-    此处直接使用 app.core.query 模块中已初始化的 OpenAI 客户端。
+    走 tracked_chat_completion 以获得空响应防护与重试。
     """
-    response = agicto_client.chat.completions.create(
+    response = tracked_chat_completion(
+        client=agicto_client,
         model=model,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7,
+        source="qdrant_benchmark-查询生成",
     )
     return response.choices[0].message.content
 
@@ -194,10 +225,15 @@ def generate_test_queries() -> List[str]:
     2. 从 conversations 表抽取历史 user query
     3. 合并去重，保存为 benchmark_queries.json
     """
-    # 若已有缓存则直接加载
+    # 若已有缓存则直接加载（兼容旧格式裸列表与新格式含指纹）
     if os.path.exists(QUERIES_FILE):
         with open(QUERIES_FILE, "r", encoding="utf-8") as f:
-            queries = json.load(f)
+            payload = json.load(f)
+        if isinstance(payload, dict) and "queries" in payload:
+            logger.info("查询缓存指纹: %s", payload.get("fingerprint"))
+            queries = payload["queries"]
+        else:
+            queries = payload
         logger.info("已加载缓存测试 query: %s 条 -> %s", len(queries), QUERIES_FILE)
         return queries
 
@@ -224,14 +260,26 @@ def generate_test_queries() -> List[str]:
         time.sleep(LLM_CALL_INTERVAL)
     logger.info("从 chunk 生成提问完成: %s 条", len(generated_queries))
 
-    # 3. 从 SQLite 抽取历史 query
+    # 3. 从 SQLite 抽取历史 query（表不存在时容错返回空列表）
     history_queries = load_history_queries()
     logger.info("从 conversations 表抽取历史 query: %s 条", len(history_queries))
     if len(history_queries) > TARGET_HISTORY_QUERY_COUNT:
         history_queries = random.sample(history_queries, TARGET_HISTORY_QUERY_COUNT)
 
+    # 3.5 从沉淀知识抽取种子文本并改写为提问（弥补 conversations 表缺失时的种子量）
+    distilled_texts = load_distilled_knowledge_texts()
+    distilled_queries = []
+    for i, text in enumerate(distilled_texts, 1):
+        questions = generate_questions_for_chunk(text)
+        distilled_queries.extend(questions)
+        if i % 5 == 0 or i == len(distilled_texts):
+            logger.info("  沉淀知识已处理 %s/%s 条，累计生成 %s 条提问",
+                        i, len(distilled_texts), len(distilled_queries))
+        time.sleep(LLM_CALL_INTERVAL)
+    logger.info("从沉淀知识生成提问完成: %s 条", len(distilled_queries))
+
     # 4. 合并去重（大小写不敏感去重，保留原始写法）
-    all_queries = generated_queries + history_queries
+    all_queries = generated_queries + distilled_queries + history_queries
     seen = set()
     unique_queries = []
     for q in all_queries:
@@ -241,10 +289,17 @@ def generate_test_queries() -> List[str]:
             unique_queries.append(q.strip())
     logger.info("合并去重后共 %s 条测试 query", len(unique_queries))
 
-    # 5. 保存
+    # 5. 保存（含指纹，便于溯源；硬一致性由 embedding meta 的 query_hash 保证）
     os.makedirs(STATS_DIR, exist_ok=True)
+    fingerprint = {
+        "source": "docx+history",
+        "docs_signature": _docs_signature(),
+        "chat_model": CHAT_MODEL,
+        "seed": RANDOM_SEED,
+        "created_at": datetime.now().isoformat(),
+    }
     with open(QUERIES_FILE, "w", encoding="utf-8") as f:
-        json.dump(unique_queries, f, ensure_ascii=False, indent=2)
+        json.dump({"fingerprint": fingerprint, "queries": unique_queries}, f, ensure_ascii=False, indent=2)
     logger.info("已保存测试 query -> %s", QUERIES_FILE)
 
     return unique_queries
@@ -258,14 +313,20 @@ def compute_query_embeddings(queries: List[str]) -> np.ndarray:
     所有检索（Ground Truth / FAISS / Qdrant）共用同一份 embedding，
     确保 query 侧变量唯一可控。
     """
-    # 若已有缓存且数量匹配则直接加载
-    if os.path.exists(EMBEDDINGS_FILE):
+    # 缓存硬校验：npy + meta sidecar 双文件，模型名与 query_hash 必须同时匹配，
+    # 否则视为跨模型世代/跨查询集的陈旧缓存，强制重算（旧缓存曾导致 GT 与检索侧向量空间不一致）
+    if os.path.exists(EMBEDDINGS_FILE) and os.path.exists(EMBEDDINGS_META_FILE):
+        with open(EMBEDDINGS_META_FILE, "r", encoding="utf-8") as f:
+            meta = json.load(f)
         cached = np.load(EMBEDDINGS_FILE)
-        if cached.shape[0] == len(queries):
-            logger.info("已加载缓存 embedding: %s 条 -> %s", cached.shape[0], EMBEDDINGS_FILE)
+        if (cached.shape[0] == len(queries)
+                and meta.get("query_hash") == _queries_hash(queries)
+                and meta.get("embedding_model") == MULTIMODAL_EMBEDDING_MODEL):
+            logger.info("已加载缓存 embedding: %s 条（指纹匹配） -> %s", cached.shape[0], EMBEDDINGS_FILE)
             return cached
-        logger.warning("缓存 embedding 数量(%s)与 query 数量(%s)不匹配，重新计算",
-                       cached.shape[0], len(queries))
+        logger.warning("embedding 缓存指纹不匹配（模型或查询集已变更），重新计算")
+    elif os.path.exists(EMBEDDINGS_FILE):
+        logger.warning("embedding 缓存缺少指纹元文件（旧时代缓存），重新计算")
 
     logger.info("开始批量计算 %s 条 query embedding...", len(queries))
     embeddings = []
@@ -279,6 +340,16 @@ def compute_query_embeddings(queries: List[str]) -> np.ndarray:
     embeddings_np = np.array(embeddings, dtype=np.float32)
     os.makedirs(STATS_DIR, exist_ok=True)
     np.save(EMBEDDINGS_FILE, embeddings_np)
+    # 写入指纹 meta，后续运行仅当模型与查询集均未变更时才复用缓存
+    meta = {
+        "embedding_model": MULTIMODAL_EMBEDDING_MODEL,
+        "query_hash": _queries_hash(queries),
+        "count": int(embeddings_np.shape[0]),
+        "dim": int(embeddings_np.shape[1]),
+        "created_at": datetime.now().isoformat(),
+    }
+    with open(EMBEDDINGS_META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
     logger.info("已缓存 embedding(%s) -> %s", embeddings_np.shape, EMBEDDINGS_FILE)
     return embeddings_np
 
@@ -295,7 +366,7 @@ def scroll_qdrant_all_points(qdrant_client) -> Tuple[List[str], np.ndarray]:
     offset = None
     while True:
         points, next_offset = qdrant_client.scroll(
-            collection_name=QDRANT_COLLECTION_NAME,
+            collection_name=BENCH_COLLECTION_NAME,
             limit=256,
             offset=offset,
             with_payload=True,
@@ -349,10 +420,20 @@ def build_ground_truth(qdrant_client, queries: List[str], query_embeddings: np.n
                 gt_ids.append(business_ids[int(idx)])
         gt["q%d" % i] = {"query": query, "gt_ids": gt_ids}
 
-    # 保存
+    # 保存（GT 每次运行重建不缓存：暴力搜索成本为秒级，从根上避免陈旧 GT）
     os.makedirs(STATS_DIR, exist_ok=True)
+    gt_payload = {
+        "fingerprint": {
+            "collection": BENCH_COLLECTION_NAME,
+            "vector_count": len(business_ids),
+            "query_hash": _queries_hash(queries),
+            "embedding_model": MULTIMODAL_EMBEDDING_MODEL,
+            "created_at": datetime.now().isoformat(),
+        },
+        "gt": gt,
+    }
     with open(GT_FILE, "w", encoding="utf-8") as f:
-        json.dump(gt, f, ensure_ascii=False, indent=2)
+        json.dump(gt_payload, f, ensure_ascii=False, indent=2)
     logger.info("已保存 Ground Truth(%s 条) -> %s", len(gt), GT_FILE)
 
     return gt
@@ -423,7 +504,7 @@ def search_qdrant_single(qdrant_client, query_vec: List[float], top_k: int, hnsw
     """
     from qdrant_client import models
     response = qdrant_client.query_points(
-        collection_name=QDRANT_COLLECTION_NAME,
+        collection_name=BENCH_COLLECTION_NAME,
         query=query_vec,
         limit=top_k,
         with_payload=True,
@@ -482,20 +563,22 @@ def run_qdrant_search(qdrant_client, query_embeddings: np.ndarray, hnsw_ef: int)
 # ========== Step 5: 评估指标计算 ==========
 
 def compute_recall_at_k(retrieved_ids: List[str], gt_ids: List[str], k: int) -> float:
-    """Recall@K = |retrieved_top_K 与 GT_top_20 的交集| / K
+    """Recall@K = |retrieved_top_K 与 GT_top_K 的交集| / K
 
-    GT 为 Flat Index 暴力搜索的 Top-20，检索侧取 Top-K 求交集。
+    ANN 基准标准口径：衡量近似检索相对暴力精确检索（GT）的保留率。
+    GT 为 Flat Index 暴力搜索的 Top-20，此处与检索侧取相同截断的前 K 条，
+    精确搜索场景下各 K 值 recall 应恒为 1.0（可作为 ef 是否生效的判据）。
     """
     retrieved_set = set(retrieved_ids[:k])
-    gt_set = set(gt_ids[:GT_TOP_K])
+    gt_set = set(gt_ids[:k])
     if not retrieved_set:
         return 0.0
     return len(retrieved_set & gt_set) / k
 
 
 def compute_mrr(retrieved_ids: List[str], gt_ids: List[str]) -> float:
-    """MRR: 第一个命中 GT 的结果的倒数排名（1/rank）"""
-    gt_set = set(gt_ids[:GT_TOP_K])
+    """MRR: 第一个命中 GT top-K（K=SEARCH_TOP_K）的结果的倒数排名（1/rank）"""
+    gt_set = set(gt_ids[:SEARCH_TOP_K])
     for i, rid in enumerate(retrieved_ids):
         if rid in gt_set:
             return 1.0 / (i + 1)
@@ -533,7 +616,7 @@ def compute_metrics_for_system(
 
     指标包括：Recall@1/3/5/10、MRR、与 FAISS 的 Jaccard（Top-5/10）、延迟统计。
     """
-    query_keys = sorted(gt.keys())
+    query_keys = sorted(gt.keys(), key=lambda x: int(x[1:]) if x[1:].isdigit() else 0)
     n = len(query_keys)
 
     recalls = {1: [], 3: [], 5: [], 10: []}
@@ -601,8 +684,10 @@ def recommend_best_ef(qdrant_metrics_by_ef: Dict) -> Dict:
 def validate_experiment_scale(vector_count: int, query_count: int) -> Dict:
     """校验实验规模是否足以支撑 ef 调优的统计意义
 
-    Qdrant 本地持久化模式在小规模下退化为精确搜索，ef 参数不生效；
-    且样本过少时 recall 指标随机波动大，无法稳定排序 ef 档位。
+    本地持久化模式（未设 QDRANT_URL）任何规模都退化为精确暴力搜索，ef 不生效；
+    服务端模式需向量数超过 HNSW 建图阈值（bench collection 建库时 indexing_threshold=2000，
+    按 1.5 倍余量取 3000）ef 才会真实作用在 HNSW 图上；
+    样本过少时 recall 指标随机波动大，无法稳定排序 ef 档位。
 
     Args:
         vector_count: Qdrant collection 当前向量总数
@@ -612,14 +697,20 @@ def validate_experiment_scale(vector_count: int, query_count: int) -> Dict:
         dict: {valid: bool, warning: str}
     """
     warnings = []
-    if vector_count < 500:
+    server_mode = bool(os.getenv("QDRANT_URL"))
+    if not server_mode:
         warnings.append(
-            f"向量数 {vector_count} < 500，Qdrant 本地持久化模式退化为精确搜索，"
-            f"ef 参数不生效，recall 各档位无统计差异"
+            "未设置 QDRANT_URL（本地持久化模式），Qdrant 退化为精确暴力搜索，"
+            "ef 参数不生效，recall 各档位无统计差异"
         )
-    if query_count < 200:
+    elif vector_count < 750:
         warnings.append(
-            f"测试 query 数 {query_count} < 200，样本过少，recall 指标随机波动大，"
+            f"向量数 {vector_count} < 750，低于 bench collection HNSW 建图阈值（indexing_threshold=500）"
+            f"的 1.5 倍安全余量，ef 调优结果无统计意义"
+        )
+    if query_count < 30:
+        warnings.append(
+            f"测试 query 数 {query_count} < 30，样本过少，recall 指标随机波动大，"
             f"无法稳定排序 ef 档位"
         )
     if not warnings:
@@ -648,8 +739,8 @@ def main():
     # Step 3: 构建 Ground Truth（FAISS IndexFlatL2 暴力基准）
     print("\n[Step 3] 构建 Ground Truth (FAISS IndexFlatL2 暴力基准)...")
     qdrant_client = get_qdrant_client()
-    total_vectors = qdrant_client.count(collection_name=QDRANT_COLLECTION_NAME).count
-    logger.info("Qdrant collection '%s' 当前共 %s 条记录", QDRANT_COLLECTION_NAME, total_vectors)
+    total_vectors = qdrant_client.count(collection_name=BENCH_COLLECTION_NAME).count
+    logger.info("Qdrant collection '%s' 当前共 %s 条记录", BENCH_COLLECTION_NAME, total_vectors)
 
     # 规模校验：小规模下 ef 调优无统计意义，仅打印警告不中断
     scale_check = validate_experiment_scale(total_vectors, len(queries))
@@ -673,6 +764,18 @@ def main():
         print("\n[Step 5] FAISS 检索 (Top-%s)..." % SEARCH_TOP_K)
         faiss_index_type = faiss_backup[2]
         faiss_results, faiss_latencies = run_faiss_search(query_embeddings, faiss_backup)
+        # ID 命名空间校验：旧 backup metadata 的 id 与当前 collection 的 business_id
+        # 可能不是同一套（历史遗留），零重叠时对照无意义，跳过避免输出全零噪声
+        gt_id_sample = set()
+        for qkey in sorted(gt.keys())[:20]:
+            gt_id_sample.update(gt[qkey]["gt_ids"])
+        faiss_id_sample = set()
+        for res in faiss_results[:20]:
+            faiss_id_sample.update(res)
+        if gt_id_sample and not (gt_id_sample & faiss_id_sample):
+            logger.warning("FAISS backup 与 collection '%s' 的 ID 命名空间零重叠，跳过 FAISS 对照",
+                           BENCH_COLLECTION_NAME)
+            faiss_results = None
     else:
         logger.warning("FAISS backup 不存在，跳过 FAISS 检索（Jaccard 指标也将缺失）")
 
@@ -693,6 +796,7 @@ def main():
         "metadata": {
             "total_queries": len(queries),
             "total_vectors": total_vectors,
+            "collection": BENCH_COLLECTION_NAME,
             "vector_dim": QDRANT_VECTOR_SIZE,
             "gt_top_k": GT_TOP_K,
             "search_top_k": SEARCH_TOP_K,

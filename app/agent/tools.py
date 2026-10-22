@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from app.config import MEDIA_DISTANCE_THRESHOLD, KB_DIR, QDRANT_COLLECTION_NAME
 from app.core import query
+from app.core.cost_tracker import tracked_chat_completion
 
 logger = logging.getLogger(__name__)
 
@@ -371,7 +372,9 @@ def _ocr_image(image_path: str) -> Dict[str, Any]:
     image_data = f"data:image/{ext};base64,{base64_image}"
 
     try:
-        response = query.client.chat.completions.create(
+        # 走 tracked_chat_completion：自带空响应防护 + 指数退避重试
+        response = tracked_chat_completion(
+            client=query.client,
             model=OCR_MODEL,
             messages=[{
                 "role": "user",
@@ -380,6 +383,7 @@ def _ocr_image(image_path: str) -> Dict[str, Any]:
                     {"type": "text", "text": "请识别并提取这张图片中的所有文字内容，按原文输出。如果没有文字，回复'无文字'。"},
                 ],
             }],
+            source="ocr_image",
         )
         text = response.choices[0].message.content.strip()
         logger.info("ocr_image('%s') -> 提取文字 %s 字", image_path, len(text))

@@ -34,8 +34,13 @@ data/qdrant_storage/
 data/indexes/
 # SQLite 用户数据库
 data/db/
+data/users.db
 # 统计与基准测试数据
 data/stats/
+
+# ========== Office 临时锁文件 ==========
+data/knowledge_base/.~*
+~$*
 
 # ========== 编辑器与IDE ==========
 .vscode/
@@ -64,3 +69,6 @@ htmlcov/
 
 # IDE 配置
 .trae/
+
+# ========== 临时测试脚本 ==========
+hello.py

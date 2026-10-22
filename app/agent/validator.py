@@ -57,6 +57,13 @@ PASS_THRESHOLD = 0.6
 # claim 级幻觉率阈值：超过此比例的 claim 无支撑则判定为幻觉
 CLAIM_HALLUCINATION_THRESHOLD = 0.3
 
+# 分层判定开关：维度打分全部为 pass 时跳过 claim 级判定以降低成本
+# 依据：v5 评测中 Agent 首答准确率 100%，大多数答案本身质量高，无需再做 claim 级细检
+# 设为 False 可回到旧行为（每条都跑 claim 级判定）
+ENABLE_TIERED_VALIDATION = True
+# 跳过 claim 判定的最小采样数：vote_samples 必须达到此值，否则仍跑 claim 级判定
+TIERED_SKIP_MIN_VOTE_SAMPLES = 2
+
 # 离散分档到数值的映射
 GRADE_TO_SCORE = {"pass": 1.0, "marginal": 0.5, "fail": 0.0}
 SCORE_TO_GRADE = {1.0: "pass", 0.5: "marginal", 0.0: "fail"}
@@ -174,6 +181,12 @@ def validate_answer(
 ) -> Dict[str, Any]:
     """对 Agent 生成的答案进行双重验证（维度打分+claim级判定）
 
+    分层判定（ENABLE_TIERED_VALIDATION=True 时生效）：
+    - 第一层：离散分档 + 多次采样投票（3 次调用）
+    - 第二层：claim 级蕴含判定（1 次调用）
+    - 若第一层三维众数全部为 pass 且采样数充足，跳过第二层以降低成本
+    - 第二层失败（解析异常等）不影响第一层结果，claim_count=0 时上层按维度打分判定
+
     Args:
         references: 检索到的原文片段列表，每项应含 content/source 字段
         answer: Agent 生成的答案文本
@@ -182,6 +195,7 @@ def validate_answer(
     Returns:
         验证结果 dict，格式见模块文档。
         解析失败时返回默认零分结果。
+        claim_skipped=True 表示第二层被跳过（高置信度路径）。
     """
     # 构建检索原文文本
     context_str = _build_context_str(references)
@@ -189,12 +203,58 @@ def validate_answer(
     # ===== 1. 维度打分：离散分档 + 多次采样投票 =====
     dimension_result = _vote_on_dimensions(context_str, answer, tracker)
 
-    # ===== 2. claim 级幻觉判定 =====
-    claim_result = _evaluate_claims(context_str, answer, tracker)
+    # ===== 2. claim 级幻觉判定（分层判定：高置信度跳过） =====
+    if ENABLE_TIERED_VALIDATION and _should_skip_claim_check(dimension_result):
+        logger.info(
+            "分层判定：三维全 pass（accuracy=%s, citation=%s, reasoning=%s, overall=%.2f, vote_samples=%s），"
+            "跳过 claim 级判定以降成本",
+            dimension_result["accuracy"]["grade"],
+            dimension_result["citation"]["grade"],
+            dimension_result["reasoning"]["grade"],
+            dimension_result["overall"],
+            dimension_result.get("vote_samples", 0),
+        )
+        claim_result = _skipped_claim_result("三维全 pass 高置信度路径，跳过 claim 级判定")
+    else:
+        claim_result = _evaluate_claims(context_str, answer, tracker)
 
     # ===== 合并结果 =====
     result = {**dimension_result, **claim_result}
     return result
+
+
+def _should_skip_claim_check(dimension_result: Dict[str, Any]) -> bool:
+    """判断是否可跳过 claim 级判定
+
+    跳过条件（同时满足）：
+    - 三个维度众数 grade 均为 "pass"（无 marginal / fail）
+    - vote_samples 达到 TIERED_SKIP_MIN_VOTE_SAMPLES（采样数可信）
+    """
+    if dimension_result.get("vote_samples", 0) < TIERED_SKIP_MIN_VOTE_SAMPLES:
+        return False
+    for dim in ("accuracy", "citation", "reasoning"):
+        grade = dimension_result.get(dim, {}).get("grade")
+        if grade != "pass":
+            return False
+    return True
+
+
+def _skipped_claim_result(reason: str) -> Dict[str, Any]:
+    """分层判定跳过 claim 级判定时的占位结果
+
+    与 _default_claim_failed_result 的差别：
+    - claim_skipped=True 显式标记跳过（上层可据此统计节省的调用次数）
+    - 不算错误（没有 claim_error 字段）
+    """
+    return {
+        "claims": [],
+        "claim_count": 0,
+        "unsupported_count": 0,
+        "claim_hallucination_rate": 0.0,
+        "claim_level_hallucination": False,
+        "claim_skipped": True,
+        "claim_skipped_reason": reason,
+    }
 
 
 def _build_context_str(references: List[Dict[str, Any]]) -> str:
@@ -429,6 +489,10 @@ def format_validation_summary(result: Dict[str, Any]) -> str:
         f"推理链: {result['reasoning']['grade']} - {result['reasoning']['reason']}",
         f"综合: {result['overall']} | {'通过' if result['passed'] else '不通过'} | 采样{result.get('vote_samples', 0)}次",
     ]
+    # 分层判定：claim 被跳过时显式标注
+    if result.get("claim_skipped"):
+        lines.append(f"Claim 级: 已跳过（{result.get('claim_skipped_reason', '高置信度路径')}）")
+        return "\n".join(lines)
     claim_count = result.get("claim_count", 0)
     if claim_count:
         lines.append(

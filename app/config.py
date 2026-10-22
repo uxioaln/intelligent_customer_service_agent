@@ -81,7 +81,8 @@ DIVERSE_REWRITE_MODEL = "deepseek-v4-pro"
 VISION_MODEL = "qwen-vl-plus"
 
 # Rerank 精排模型（AGICTO 平台 cross-encoder，走 /v1/rerank 接口）
-RERANK_MODEL = "rerank-v3.5"
+# 注：原 rerank-v3.5 上游 Cohere 欠费停用，切换为 gte-rerank-v2（中文区分度更好）
+RERANK_MODEL = "gte-rerank-v2"
 
 # 图片/视频多样化问题生成数量（每条素材扩充的问题数，影响跨模态召回覆盖度）
 MEDIA_DIVERSE_QUESTION_NUM = 8
